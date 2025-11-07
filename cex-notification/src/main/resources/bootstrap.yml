@@ -1,0 +1,22 @@
+# Spring Cloud Bootstrap配置（仅放注册/配置中心）
+
+spring:
+  application:
+    name: cex-notification
+  cloud:
+    nacos:
+      config:
+        server-addr: localhost:8848
+        namespace: public
+        group: DEFAULT_GROUP
+        file-extension: yaml
+        enabled: true
+        refresh-enabled: true
+      discovery:
+        server-addr: localhost:8848
+        namespace: public
+        group: DEFAULT_GROUP
+        enabled: true
+
+
+

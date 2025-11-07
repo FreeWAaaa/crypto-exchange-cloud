@@ -1,0 +1,50 @@
+# Spring Cloud Bootstrap配置文件
+# 用于在应用启动时加载外部配置，优先级高于application.yml
+# 主要用于配置注册中心、配置中心等基础设施
+
+spring:
+  # 应用名称
+  application:
+    name: cex-admin
+  
+  # Spring Cloud配置
+  cloud:
+    # Nacos配置中心
+    nacos:
+      config:
+        # Nacos服务器地址
+        server-addr: localhost:8848
+        # 命名空间，默认为public
+        namespace: public
+        # 配置分组，默认为DEFAULT_GROUP
+        group: DEFAULT_GROUP
+        # 配置文件扩展名
+        file-extension: yaml
+        # 是否启用配置中心
+        enabled: true
+        # 配置刷新
+        refresh-enabled: true
+        # 共享配置
+        shared-configs:
+          - data-id: common-config.yaml
+            group: DEFAULT_GROUP
+            refresh: true
+      
+      # Nacos服务发现
+      discovery:
+        # Nacos服务器地址
+        server-addr: localhost:8848
+        # 命名空间
+        namespace: public
+        # 服务分组
+        group: DEFAULT_GROUP
+        # 是否启用服务发现
+        enabled: true
+        # 服务实例权重
+        weight: 1
+        # 服务实例元数据
+        metadata:
+          version: 1.0.0
+          zone: default
+
+

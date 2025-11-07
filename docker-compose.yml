@@ -1,0 +1,221 @@
+version: '3.8'
+
+services:
+  # MySQL数据库
+  mysql:
+    image: mysql:8.0
+    container_name: cex-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: cex
+    ports:
+      - "3306:3306"
+    volumes:
+      - /Users/subby/docker-data/mysql/data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d
+    command: --default-authentication-plugin=mysql_native_password
+
+  # Redis缓存
+  redis:
+    image: redis:6.2-alpine
+    container_name: cex-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - /Users/subby/docker-data/redis/data:/data
+
+  # Nacos注册中心
+  nacos:
+    image: nacos/nacos-server:v2.2.0
+    container_name: nacos
+    environment:
+      MODE: standalone
+      SPRING_DATASOURCE_PLATFORM: mysql # 这里的mysql都是站在这个配置文件本身，那么自然就是上面的mysql容器了 如果我们之前本身就有想用之前的就替换成下面这个且吧depends_on去掉
+#      MYSQL_SERVICE_HOST: host.docker.internal  使用本机docker内网地址访问mysql（用本身docker之前就启动的mysql容器）
+      MYSQL_SERVICE_HOST: mysql
+      MYSQL_SERVICE_DB_NAME: nacos
+      MYSQL_SERVICE_USER: root
+      MYSQL_SERVICE_PASSWORD: 123456
+      MYSQL_SERVICE_PORT: "3306"
+      MYSQL_SERVICE_DB_PARAM: "characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false"
+    ports:
+      - "8848:8848"
+      - "9848:9848"
+    depends_on:
+      - mysql
+    volumes:
+      - /Users/subby/docker-data/nacos/logs:/home/nacos/logs
+      - /Users/subby/docker-data/nacos/data:/home/nacos/data
+
+  # RocketMQ NameServer
+  rocketmq-nameserver:
+    image: apache/rocketmq:4.9.4
+    platform: linux/amd64        # 可选，ARM 上更稳定
+    container_name: rocketmq-nameserver
+    environment:
+      JAVA_OPT_EXT: "-Xms512M -Xmx512M -Xmn128m"
+    command: sh -c "cd /home/rocketmq/rocketmq-4.9.4/bin && ./mqnamesrv"
+    ports:
+      - "9876:9876"
+    volumes:
+      - /Users/subby/docker-data/rocketmq/nameserver/logs:/home/rocketmq/logs
+      - /Users/subby/docker-data/rocketmq/nameserver/store:/home/rocketmq/store
+
+
+  # RocketMQ Broker
+  rocketmq-broker:
+    image: apache/rocketmq:4.9.4
+    platform: linux/amd64
+    container_name: rocketmq-broker
+    environment:
+      NAMESRV_ADDR: rocketmq-nameserver:9876
+      JAVA_OPT_EXT: "-Xms512M -Xmx512M -Xmn128m"
+    command: sh -c "cd /home/rocketmq/rocketmq-4.9.4/bin && ./mqbroker -n rocketmq-nameserver:9876 autoCreateTopicEnable=true"
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+    volumes:
+      - /Users/subby/docker-data/rocketmq/broker/logs:/home/rocketmq/logs
+      - /Users/subby/docker-data/rocketmq/broker/store:/home/rocketmq/store
+    depends_on:
+      - rocketmq-nameserver
+
+
+  # RocketMQ Console
+  rocketmq-console:
+    image: styletang/rocketmq-console-ng:latest
+    platform: linux/amd64
+    container_name: rocketmq-console
+    environment:
+      JAVA_OPTS: "-Drocketmq.namesrv.addr=rocketmq-nameserver:9876"
+    ports:
+      - "8089:8080"  # 宿主:容器
+#    depends_on:
+#      - rocketmq-nameserver
+#      - rocketmq-broker
+
+  # API网关
+  gateway:
+    build: ./cex-gateway
+    container_name: gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      - nacos
+      - redis
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_REDIS_HOST: redis
+
+  # 用户服务
+  user-service:
+    build: ./cex-user
+    container_name: cex-user
+    ports:
+      - "8081:8081"
+    depends_on:
+      - nacos
+      - mysql
+      - redis
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_user?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
+      SPRING_REDIS_HOST: redis
+
+  # 交易服务
+  trade-service:
+    build: ./cex-trade
+    container_name: cex-trade
+    ports:
+      - "8082:8082"
+    depends_on:
+      - nacos
+      - mysql
+      - redis
+      - rocketmq-broker
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_trade?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
+      SPRING_REDIS_HOST: redis
+      SPRING_CLOUD_STREAM_ROCKETMQ_BINDER_NAME_SERVER: rocketmq-nameserver:9876
+
+  # 钱包服务
+  wallet-service:
+    build: ./cex-wallet
+    container_name: cex-wallet
+    ports:
+      - "8083:8083"
+    depends_on:
+      - nacos
+      - mysql
+      - redis
+      - rocketmq-broker
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_wallet?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
+      SPRING_REDIS_HOST: redis
+      SPRING_CLOUD_STREAM_ROCKETMQ_BINDER_NAME_SERVER: rocketmq-nameserver:9876
+
+  # 撮合引擎
+  matching-service:
+    build: ./cex-matching
+    container_name: cex-matching
+    ports:
+      - "8084:8084"
+    depends_on:
+      - nacos
+      - redis
+      - rocketmq-broker
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_REDIS_HOST: redis
+      SPRING_CLOUD_STREAM_ROCKETMQ_BINDER_NAME_SERVER: rocketmq-nameserver:9876
+
+  # 管理服务
+  admin-service:
+    build: ./cex-admin
+    container_name: cex-admin
+    ports:
+      - "8085:8085"
+    depends_on:
+      - nacos
+      - mysql
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_admin?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
+
+  # 通知服务
+  notification-service:
+    build: ./cex-notification
+    container_name: cex-notification
+    ports:
+      - "8086:8086"
+    depends_on:
+      - nacos
+      - mysql
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_notification?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
+
+  # 活动服务
+  activity-service:
+    build: ./cex-activity
+    container_name: cex-activity
+    ports:
+      - "8087:8087"
+    depends_on:
+      - nacos
+      - mysql
+    environment:
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_activity?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
+
+

@@ -1,0 +1,406 @@
+package com.cex.trade.service.impl;
+
+import com.alibaba.fastjson.JSON;
+import com.cex.common.dto.OrderDTO;
+import com.cex.trade.domain.entity.TradeOrder;
+import com.cex.trade.domain.entity.TradeSymbol;
+import com.cex.trade.mapper.TradeOrderMapper;
+import com.cex.trade.mapper.TradeSymbolMapper;
+import com.cex.trade.service.TradeOrderService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cloud.stream.function.StreamBridge;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.util.Date;
+import java.util.List;
+
+/**
+ * 交易订单服务实现
+ * 
+ * @author cex
+ */
+@Slf4j
+@Service
+public class TradeOrderServiceImpl implements TradeOrderService {
+
+    @Autowired
+    private TradeOrderMapper orderMapper;
+
+    @Autowired
+    private TradeSymbolMapper symbolMapper;
+    
+    @Autowired
+    private StreamBridge streamBridge;
+
+    // TODO: 注入 Wallet 服务（Feign调用）
+    // @Autowired
+    // private WalletFeignClient walletClient;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public String placeOrder(Long userId, String symbol, Integer orderType, Integer side, 
+                            BigDecimal price, BigDecimal amount, String clientOrderId) {
+        
+        log.info("用户下单：userId={}, symbol={}, type={}, side={}, price={}, amount={}", 
+                 userId, symbol, orderType, side, price, amount);
+
+        // 1. 参数校验
+        validateOrderParams(orderType, side, price, amount);
+
+        // 2. 查询交易对配置
+        TradeSymbol tradeSymbol = symbolMapper.selectBySymbol(symbol);
+        if (tradeSymbol == null) {
+            throw new RuntimeException("交易对不存在：" + symbol);
+        }
+        if (tradeSymbol.getStatus() != 0) {
+            throw new RuntimeException("交易对已停用");
+        }
+        if (tradeSymbol.getTradeable() == 0) {
+            throw new RuntimeException("该交易对暂停交易");
+        }
+
+        // 3. 校验交易对配置
+        validateSymbolConfig(tradeSymbol, orderType, side, price, amount);
+
+        // 4. 校验用户当前委托数量
+        Integer currentCount = orderMapper.countCurrentOrders(userId, symbol);
+        if (tradeSymbol.getMaxTradingOrder() > 0 && currentCount >= tradeSymbol.getMaxTradingOrder()) {
+            throw new RuntimeException("超过最大委托数量限制：" + tradeSymbol.getMaxTradingOrder());
+        }
+
+        // 5. 计算需要冻结的金额
+        BigDecimal freezeAmount = calculateFreezeAmount(orderType, side, price, amount);
+        String freezeCoin = getFreezeCoin(side, tradeSymbol);
+
+        // 6. 冻结余额（调用Wallet服务）
+        // TODO: 实际调用 Wallet 服务
+        // walletClient.freezeBalance(userId, freezeCoin, freezeAmount, null, "下单");
+        log.info("冻结余额：userId={}, coin={}, amount={}", userId, freezeCoin, freezeAmount);
+
+        // 7. 创建订单
+        TradeOrder order = buildOrder(userId, tradeSymbol, orderType, side, price, amount, clientOrderId);
+        orderMapper.insert(order);
+
+        log.info("订单创建成功：orderNo={}", order.getOrderNo());
+
+        // 8. 发送到撮合引擎
+        sendToMatchingEngine(order);
+        
+        return order.getOrderNo();
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void cancelOrder(Long userId, String orderNo) {
+        log.info("用户撤单：userId={}, orderNo={}", userId, orderNo);
+
+        // 1. 查询订单
+        TradeOrder order = orderMapper.selectByOrderNo(orderNo);
+        if (order == null) {
+            throw new RuntimeException("订单不存在");
+        }
+
+        // 2. 校验权限
+        if (!order.getUserId().equals(userId)) {
+            throw new RuntimeException("无权操作此订单");
+        }
+
+        // 3. 校验订单状态
+        if (order.getStatus() != 0 && order.getStatus() != 1) {
+            throw new RuntimeException("订单无法撤销，当前状态：" + getStatusName(order.getStatus()));
+        }
+
+        // 4. 发送撤单消息到撮合引擎
+        sendCancelToMatchingEngine(order);
+        
+        // 5. 计算需要解冻的金额
+        BigDecimal unfreezeAmount = calculateUnfreezeAmount(order);
+        TradeSymbol symbol = symbolMapper.selectBySymbol(order.getSymbol());
+        String unfreezeCoin = getFreezeCoin(order.getSide(), symbol);
+
+        // 6. 解冻余额
+        // TODO: walletClient.unfreezeBalance(userId, unfreezeCoin, unfreezeAmount, orderNo, "撤单");
+        log.info("解冻余额：userId={}, coin={}, amount={}", userId, unfreezeCoin, unfreezeAmount);
+
+        // 7. 更新订单状态
+        order.setStatus(3); // 已撤销
+        order.setCancelTime(new Date());
+        order.setCancelReason("用户撤单");
+        orderMapper.updateById(order);
+
+        log.info("撤单成功：orderNo={}", orderNo);
+    }
+
+    @Override
+    public List<TradeOrder> getCurrentOrders(Long userId) {
+        return orderMapper.selectCurrentOrders(userId);
+    }
+
+    @Override
+    public List<TradeOrder> getCurrentOrdersBySymbol(Long userId, String symbol) {
+        return orderMapper.selectCurrentOrdersBySymbol(userId, symbol);
+    }
+
+    @Override
+    public List<TradeOrder> getHistoryOrders(Long userId) {
+        return orderMapper.selectHistoryOrders(userId);
+    }
+
+    @Override
+    public List<TradeOrder> getHistoryOrdersBySymbol(Long userId, String symbol) {
+        return orderMapper.selectHistoryOrdersBySymbol(userId, symbol);
+    }
+
+    @Override
+    public TradeOrder getByOrderNo(String orderNo) {
+        return orderMapper.selectByOrderNo(orderNo);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void updateOrderFilled(String orderNo, BigDecimal filledAmount, BigDecimal filledMoney, 
+                                 BigDecimal fee, Integer status) {
+        TradeOrder order = orderMapper.selectByOrderNo(orderNo);
+        if (order == null) {
+            log.warn("订单不存在：{}", orderNo);
+            return;
+        }
+
+        order.setFilledAmount(filledAmount);
+        order.setFilledMoney(filledMoney);
+        order.setFee(fee);
+        order.setStatus(status);
+        
+        // 计算平均成交价
+        order.calculateAvgPrice();
+        
+        // 如果完全成交，记录完成时间
+        if (status == 2) {
+            order.setCompleteTime(new Date());
+        }
+
+        orderMapper.updateById(order);
+        log.info("订单成交信息已更新：orderNo={}, filledAmount={}, status={}", orderNo, filledAmount, status);
+    }
+
+    /**
+     * 参数校验
+     */
+    private void validateOrderParams(Integer orderType, Integer side, BigDecimal price, BigDecimal amount) {
+        if (orderType == null || (orderType != 1 && orderType != 2)) {
+            throw new RuntimeException("订单类型错误");
+        }
+        if (side == null || (side != 1 && side != 2)) {
+            throw new RuntimeException("买卖方向错误");
+        }
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new RuntimeException("数量必须大于0");
+        }
+        // 限价单价格必须大于0
+        if (orderType == 1 && (price == null || price.compareTo(BigDecimal.ZERO) <= 0)) {
+            throw new RuntimeException("限价单价格必须大于0");
+        }
+    }
+
+    /**
+     * 校验交易对配置
+     */
+    private void validateSymbolConfig(TradeSymbol symbol, Integer orderType, Integer side, 
+                                      BigDecimal price, BigDecimal amount) {
+        // 检查市价买卖是否启用
+        if (orderType == 2) {
+            if (side == 1 && symbol.getEnableMarketBuy() == 0) {
+                throw new RuntimeException("该交易对不支持市价买入");
+            }
+            if (side == 2 && symbol.getEnableMarketSell() == 0) {
+                throw new RuntimeException("该交易对不支持市价卖出");
+            }
+        }
+
+        // 检查数量范围
+        if (amount.compareTo(symbol.getMinTradeAmount()) < 0) {
+            throw new RuntimeException("数量小于最小交易量：" + symbol.getMinTradeAmount());
+        }
+        if (symbol.getMaxTradeAmount() != null && symbol.getMaxTradeAmount().compareTo(BigDecimal.ZERO) > 0) {
+            if (amount.compareTo(symbol.getMaxTradeAmount()) > 0) {
+                throw new RuntimeException("数量超过最大交易量：" + symbol.getMaxTradeAmount());
+            }
+        }
+
+        // 限价单检查价格范围
+        if (orderType == 1) {
+            if (symbol.getMinSellPrice() != null && side == 2 && price.compareTo(symbol.getMinSellPrice()) < 0) {
+                throw new RuntimeException("卖出价格低于最低限价：" + symbol.getMinSellPrice());
+            }
+            if (symbol.getMaxBuyPrice() != null && side == 1 && price.compareTo(symbol.getMaxBuyPrice()) > 0) {
+                throw new RuntimeException("买入价格高于最高限价：" + symbol.getMaxBuyPrice());
+            }
+        }
+
+        // 检查最小成交额
+        if (orderType == 1 && symbol.getMinTurnover() != null) {
+            BigDecimal turnover = price.multiply(amount);
+            if (turnover.compareTo(symbol.getMinTurnover()) < 0) {
+                throw new RuntimeException("成交额小于最小限额：" + symbol.getMinTurnover());
+            }
+        }
+    }
+
+    /**
+     * 计算需要冻结的金额
+     */
+    private BigDecimal calculateFreezeAmount(Integer orderType, Integer side, BigDecimal price, BigDecimal amount) {
+        if (orderType == 1) {  // 限价单
+            if (side == 1) {  // 买入：冻结 价格×数量 的计价币
+                return price.multiply(amount);
+            } else {  // 卖出：冻结 数量 的基础币
+                return amount;
+            }
+        } else {  // 市价单
+            if (side == 1) {  // 市价买入：冻结 金额 的计价币
+                return amount;
+            } else {  // 市价卖出：冻结 数量 的基础币
+                return amount;
+            }
+        }
+    }
+
+    /**
+     * 获取需要冻结的币种
+     */
+    private String getFreezeCoin(Integer side, TradeSymbol symbol) {
+        if (side == 1) {  // 买入：冻结计价币（USDT）
+            return symbol.getQuoteCoin();
+        } else {  // 卖出：冻结基础币（BTC）
+            return symbol.getBaseCoin();
+        }
+    }
+
+    /**
+     * 计算撤单需要解冻的金额
+     */
+    private BigDecimal calculateUnfreezeAmount(TradeOrder order) {
+        BigDecimal unfilledAmount = order.getAmount().subtract(order.getFilledAmount());
+        
+        if (order.getOrderType() == 1) {  // 限价单
+            if (order.getSide() == 1) {  // 限价买单：未成交金额
+                return order.getPrice().multiply(unfilledAmount);
+            } else {  // 限价卖单：未成交数量
+                return unfilledAmount;
+            }
+        } else {  // 市价单
+            if (order.getSide() == 1) {  // 市价买单：未成交金额
+                return order.getAmount().subtract(order.getFilledMoney());
+            } else {  // 市价卖单：未成交数量
+                return unfilledAmount;
+            }
+        }
+    }
+
+    /**
+     * 构建订单对象
+     */
+    private TradeOrder buildOrder(Long userId, TradeSymbol symbol, Integer orderType, Integer side, 
+                                 BigDecimal price, BigDecimal amount, String clientOrderId) {
+        TradeOrder order = new TradeOrder();
+        
+        // 生成订单号：E + 时间戳 + 随机6位
+        String orderNo = "E" + System.currentTimeMillis() + String.format("%06d", (int)(Math.random() * 1000000));
+        order.setOrderNo(orderNo);
+        order.setUserId(userId);
+        order.setSymbol(symbol.getSymbol());
+        order.setBaseCoin(symbol.getBaseCoin());
+        order.setQuoteCoin(symbol.getQuoteCoin());
+        order.setOrderType(orderType);
+        order.setSide(side);
+        order.setPrice(orderType == 2 ? BigDecimal.ZERO : price); // 市价单价格为0
+        order.setAmount(amount);
+        order.setFilledAmount(BigDecimal.ZERO);
+        order.setFilledMoney(BigDecimal.ZERO);
+        order.setAvgPrice(BigDecimal.ZERO);
+        order.setStatus(0); // 待成交
+        order.setFee(BigDecimal.ZERO);
+        order.setFeeCoin(side == 1 ? symbol.getBaseCoin() : symbol.getQuoteCoin());
+        order.setSource(1); // Web
+        order.setClientOrderId(clientOrderId);
+        order.setUseDiscount(0);
+        
+        return order;
+    }
+
+    /**
+     * 获取状态名称
+     */
+    private String getStatusName(Integer status) {
+        switch (status) {
+            case 0: return "待成交";
+            case 1: return "部分成交";
+            case 2: return "完全成交";
+            case 3: return "已撤销";
+            case 4: return "超时";
+            default: return "未知";
+        }
+    }
+    
+    /**
+     * 发送订单到撮合引擎
+     */
+    private void sendToMatchingEngine(TradeOrder order) {
+        try {
+            // 转换为OrderDTO
+            OrderDTO orderDTO = new OrderDTO();
+            orderDTO.setOrderNo(order.getOrderNo());
+            orderDTO.setUserId(order.getUserId());
+            orderDTO.setSymbol(order.getSymbol());
+            orderDTO.setOrderType(order.getOrderType());
+            orderDTO.setSide(order.getSide());
+            orderDTO.setPrice(order.getPrice());
+            orderDTO.setAmount(order.getAmount());
+            orderDTO.setFilledAmount(order.getFilledAmount());
+            orderDTO.setFilledMoney(order.getFilledMoney());
+            orderDTO.setFeeRate(BigDecimal.ZERO);  // TODO: 从配置获取
+            orderDTO.setFeeCoin(order.getFeeCoin());
+            orderDTO.setStatus(order.getStatus());
+            orderDTO.setCreateTime(System.currentTimeMillis());
+            
+            String json = JSON.toJSONString(orderDTO);
+            streamBridge.send("order-input", MessageBuilder.withPayload(json).build());
+            log.info("订单已发送到撮合引擎：orderNo={}", order.getOrderNo());
+        } catch (Exception e) {
+            log.error("发送订单到撮合引擎失败：orderNo={}", order.getOrderNo(), e);
+        }
+    }
+    
+    /**
+     * 发送撤单请求到撮合引擎
+     */
+    private void sendCancelToMatchingEngine(TradeOrder order) {
+        try {
+            // 转换为OrderDTO
+            OrderDTO orderDTO = new OrderDTO();
+            orderDTO.setOrderNo(order.getOrderNo());
+            orderDTO.setUserId(order.getUserId());
+            orderDTO.setSymbol(order.getSymbol());
+            orderDTO.setOrderType(order.getOrderType());
+            orderDTO.setSide(order.getSide());
+            orderDTO.setPrice(order.getPrice());
+            orderDTO.setAmount(order.getAmount());
+            orderDTO.setFilledAmount(order.getFilledAmount());
+            orderDTO.setFilledMoney(order.getFilledMoney());
+            orderDTO.setStatus(order.getStatus());
+            orderDTO.setCreateTime(order.getCreateTime() != null ? 
+                    order.getCreateTime().atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() : System.currentTimeMillis());
+            
+            String json = JSON.toJSONString(orderDTO);
+            streamBridge.send("order-cancel-input", MessageBuilder.withPayload(json).build());
+            log.info("撤单请求已发送到撮合引擎：orderNo={}", order.getOrderNo());
+        } catch (Exception e) {
+            log.error("发送撤单请求到撮合引擎失败：orderNo={}", order.getOrderNo(), e);
+        }
+    }
+}
+
