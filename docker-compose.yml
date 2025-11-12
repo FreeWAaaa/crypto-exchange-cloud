@@ -218,4 +218,17 @@ services:
       SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_activity?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
 
+  ipfs:
+    image: ipfs/kubo:latest
+    container_name: ipfs-node
+    ports:
+      - "4001:4001"   # Swarm端口（P2P通信）
+      - "5001:5001"   # API端口（本地调用）
+      - "8888:8080"   # Gateway端口（HTTP访问，映射到8888）
+    volumes:
+      - /Users/subby/docker-data/ipfs/data:/data/ipfs        # 数据目录（必须挂载）
+      - /Users/subby/docker-data/ipfs/staging:/data/ipfs/staging  # 临时目录（可选）
+    restart: unless-stopped
+
+
 
