@@ -1,5 +1,6 @@
 package com.cex.matching.core;
 
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.stream.function.StreamBridge;
 import org.springframework.stereotype.Component;
@@ -14,15 +15,12 @@ import java.util.concurrent.ConcurrentMap;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class CoinTraderFactory {
     
     private final ConcurrentMap<String, CoinTrader> traders = new ConcurrentHashMap<>();
     
-    private StreamBridge streamBridge;
-    
-    public void setStreamBridge(StreamBridge streamBridge) {
-        this.streamBridge = streamBridge;
-    }
+    private final StreamBridge streamBridge;
     
     /**
      * 获取或创建交易器
