@@ -117,6 +117,8 @@ public class CoinTraderFactory {
         // 使用 computeIfAbsent 实现懒加载
         // - 如果 symbol 已存在，直接返回对应的 CoinTrader
         // - 如果 symbol 不存在，执行 lambda 创建新的 CoinTrader
+        // ConcurrentHashMap + computeIfAbsent 保证所有线程（不只是同一个线程）拿到的都是同一个 CoinTrader 实例
+        // computeIfAbsent() 是原子操作，即使多个线程同时调用，也只会创建一个实例
         return traders.computeIfAbsent(symbol, sym -> {
             // 创建新的 CoinTrader 实例
             // 每个 CoinTrader 管理一个交易对的所有订单簿

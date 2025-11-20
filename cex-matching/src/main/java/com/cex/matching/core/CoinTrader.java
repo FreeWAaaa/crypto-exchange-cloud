@@ -369,10 +369,10 @@ public class CoinTrader {
     
     /**
      * 处理订单（撮合）- 核心撮合算法入口
-     * 
+     *
      * 【作用】
      * 这是撮合引擎的核心方法，负责处理新订单的撮合。
-     * 
+     *
      * 【撮合算法流程】
      * 1. 判断订单类型（限价单/市价单）
      * 2. 判断订单方向（买入/卖出）
@@ -381,20 +381,20 @@ public class CoinTrader {
      *    - 限价单：先与限价单撮合，再与市价单撮合
      *    - 市价单：直接与限价单撮合
      * 5. 如果未完全成交，剩余部分进入订单簿
-     * 
+     *
      * 【撮合原则】
      * - 价格优先：买单价格高的优先，卖单价格低的优先
      * - 时间优先：同价格的订单，先下单的优先
-     * 
+     *
      * 【内存处理】
      * - 所有撮合都在内存中进行（TreeMap、LinkedList）
      * - 速度极快（微秒级）
      * - 撮合完成后，结果通过 MQ 发送，由其他服务负责落库
-     * 
+     *
      * 【例子】
      * ```
      * 新订单：买入 BTC/USDT，限价 50000，数量 1
-     * 
+     *
      * 1. 选择对手盘：sellLimitPriceQueue（卖盘限价单队列）
      * 2. 查找可匹配订单：
      *    - 51000 -> [订单1]  // 价格太高，不匹配
@@ -405,6 +405,15 @@ public class CoinTrader {
      * ```
      * 
      * @param exchangeOrder 待撮合的订单
+     *
+     * 线程1、线程2、线程3 同时处理 BTC/USDT 订单
+     *   ↓
+     * 都拿到同一个 CoinTrader("BTC/USDT") 实例
+     *   ↓
+     * 操作订单簿时，通过 synchronized 串行执行
+     *   ↓
+     * 保证数据一致性 ✅
+     *
      */
     public void trade(OrderDTO exchangeOrder) {
         // ========== 第一步：检查交易状态 ==========
@@ -759,6 +768,7 @@ public class CoinTrader {
      * 
      * 【作用】
      * 处理市价单与限价单的撮合。
+     * 这是市价单的主要撮合方法，市价单没有指定价格，按对手盘最优价格成交。
      * 
      * 【市价单特点】
      * - 没有指定价格，按对手盘最优价格成交
@@ -767,68 +777,125 @@ public class CoinTrader {
      * 
      * 【撮合流程】
      * 1. 从对手盘限价单队列中按价格优先顺序撮合
+     *    - 买单市价单：从卖盘最低价开始（价格从低到高）
+     *    - 卖单市价单：从买盘最高价开始（价格从高到低）
      * 2. 如果市价单还有剩余，进入市价单队列等待
      * 3. 发送成交结果到 MQ
+     * 
+     * 【撮合原则】
+     * - 价格优先：按对手盘最优价格成交
+     * - 时间优先：同价格的限价单，先下单的优先成交
+     * - 部分成交：如果限价单数量不足，可以部分成交
      * 
      * 【为什么需要 synchronized？】
      * - TreeMap 不是线程安全的
      * - 需要保护整个撮合过程的原子性
+     * - 避免在遍历和修改订单簿时出现并发问题
      * 
-     * @param lpList 对手盘限价单队列
-     * @param focusedOrder 市价单订单
+     * 【例子】
+     * ```
+     * 新订单：买入 BTC/USDT，市价单，金额 10000 USDT
+     * 
+     * 卖盘限价单队列（sellLimitPriceQueue）：
+     *   49000 -> [订单A: 0.5 BTC]
+     *   50000 -> [订单B: 0.3 BTC]
+     *   51000 -> [订单C: 0.2 BTC]
+     * 
+     * 撮合过程：
+     * 1. 从最低价开始：49000
+     * 2. 与订单A撮合：成交 0.5 BTC，价格 49000，金额 24500 USDT
+     * 3. 继续撮合：与订单B撮合，成交 0.3 BTC，价格 50000，金额 15000 USDT
+     * 4. 总金额 39500 USDT > 10000 USDT，停止撮合
+     * 5. 实际成交：0.2 BTC（从订单A），价格 49000，金额 9800 USDT
+     * ```
+     * 
+     * @param lpList 对手盘限价单队列（TreeMap<价格, MergeOrder>）
+     * @param focusedOrder 市价单订单（待撮合的订单）
      */
     private void matchMarketPriceWithLPList(TreeMap<BigDecimal, MergeOrder> lpList, OrderDTO focusedOrder) {
-        // 收集撮合结果
+        // ========== 第一步：初始化结果收集器 ==========
+        // 收集撮合过程中产生的成交记录和已完成订单
         List<TradeRecordDTO> exchangeTrades = new ArrayList<>();  // 成交记录列表
         List<OrderDTO> completedOrders = new ArrayList<>();  // 已完成订单列表
         
+        // ========== 第二步：遍历对手盘限价单队列进行撮合 ==========
         // 使用 synchronized 保护整个撮合过程
         // 原因：TreeMap 不是线程安全的，需要保护遍历和修改操作的原子性
         synchronized (lpList) {
+            // 获取订单簿的迭代器（按价格排序）
+            // - 买单市价单：从卖盘最低价开始（价格从低到高）
+            // - 卖单市价单：从买盘最高价开始（价格从高到低）
             Iterator<Map.Entry<BigDecimal, MergeOrder>> mergeOrderIterator = lpList.entrySet().iterator();
-            boolean exitLoop = false;
+            boolean exitLoop = false;  // 退出循环标志（当市价单完全成交时退出）
             
+            // 遍历所有价格档位
             while (!exitLoop && mergeOrderIterator.hasNext()) {
+                // 获取当前价格档位
                 Map.Entry<BigDecimal, MergeOrder> entry = mergeOrderIterator.next();
-                MergeOrder mergeOrder = entry.getValue();
+                MergeOrder mergeOrder = entry.getValue();  // 该价格下的所有订单
+                
+                // 遍历该价格下的所有订单（按时间排序，先到先成交）
                 Iterator<OrderDTO> orderIterator = mergeOrder.iterator();
                 
                 while (orderIterator.hasNext()) {
+                    // 获取对手盘订单
                     OrderDTO matchOrder = orderIterator.next();
+                    
+                    // ========== 第三步：执行撮合 ==========
+                    // 调用 processMatch() 计算成交价格、数量，并更新订单状态
+                    // 成交价格：以限价单的价格成交（价格优先）
                     TradeRecordDTO trade = processMatch(focusedOrder, matchOrder);
+                    
+                    // 如果撮合成功，记录成交记录
                     if (trade != null) {
                         exchangeTrades.add(trade);
                     }
                     
-                    if (matchOrder.getStatus() == 2) {  // COMPLETED
-                        orderIterator.remove();
-                        completedOrders.add(matchOrder);
+                    // ========== 第四步：处理已完成的对手盘订单 ==========
+                    // 如果对手盘订单完全成交，从订单簿中移除
+                    if (matchOrder.getStatus() == 2) {  // 2 = COMPLETED（完全成交）
+                        orderIterator.remove();  // 从 MergeOrder 中移除
+                        completedOrders.add(matchOrder);  // 记录已完成订单
                     }
                     
-                    if (focusedOrder.getStatus() == 2) {  // COMPLETED
+                    // ========== 第五步：检查市价单是否完全成交 ==========
+                    // 如果市价单完全成交，退出循环
+                    if (focusedOrder.getStatus() == 2) {  // 2 = COMPLETED（完全成交）
                         completedOrders.add(focusedOrder);
-                        exitLoop = true;
-                        break;
+                        exitLoop = true;  // 设置退出标志
+                        break;  // 退出内层循环
                     }
                 }
                 
+                // ========== 第六步：清理空的价格档位 ==========
+                // 如果该价格下没有订单了，移除整个价格档位
                 if (mergeOrder.size() == 0) {
-                    mergeOrderIterator.remove();
+                    mergeOrderIterator.remove();  // 从订单簿中移除该价格档位
                 }
             }
         }
         
-        // 如果还没交易完，订单压入列表
+        // ========== 第七步：处理未完全成交的市价单 ==========
+        // 如果市价单还有剩余，进入市价单队列等待后续撮合
         BigDecimal remainingAmount = focusedOrder.getAmount().subtract(focusedOrder.getFilledAmount());
-        if ((focusedOrder.getSide() == 2 && remainingAmount.compareTo(BigDecimal.ZERO) > 0)
-                || (focusedOrder.getSide() == 1 && focusedOrder.getFilledMoney().compareTo(focusedOrder.getAmount()) < 0)) {
-            addMarketPriceOrder(focusedOrder);
+        
+        // 判断是否需要进入市价单队列：
+        // - 卖单市价单：如果剩余数量 > 0，进入队列
+        // - 买单市价单：如果已成交金额 < 订单金额，进入队列（买单市价单按金额计算）
+        if ((focusedOrder.getSide() == 2 && remainingAmount.compareTo(BigDecimal.ZERO) > 0)  // 卖单：剩余数量 > 0
+                || (focusedOrder.getSide() == 1 && focusedOrder.getFilledMoney().compareTo(focusedOrder.getAmount()) < 0)) {  // 买单：已成交金额 < 订单金额
+            addMarketPriceOrder(focusedOrder);  // 添加到市价单队列
         }
         
+        // ========== 第八步：发送撮合结果 ==========
+        // 发送成交记录到 MQ（由其他服务负责更新数据库和用户余额）
         handleExchangeTrade(exchangeTrades);
         
+        // 发送已完成订单通知到 MQ
         if (completedOrders.size() > 0) {
             orderCompleted(completedOrders);
+            
+            // 更新盘口信息并发送到 MQ（用于前端实时展示）
             TradePlate plate = focusedOrder.getSide() == 1 ? sellTradePlate : buyTradePlate;
             sendTradePlateMessage(plate);
         }
@@ -836,38 +903,118 @@ public class CoinTrader {
     
     /**
      * 限价单与市价单撮合
+     * 
+     * 【作用】
+     * 处理限价单与市价单的撮合。
+     * 这是限价单的补充撮合方法，当限价单与限价单撮合后还有剩余时，会与市价单撮合。
+     * 
+     * 【撮合场景】
+     * - 限价单先与限价单撮合（价格优先、时间优先）
+     * - 如果限价单还有剩余，再与市价单撮合
+     * - 市价单没有价格限制，可以与任何价格的限价单撮合
+     * 
+     * 【撮合流程】
+     * 1. 从对手盘市价单队列中按时间顺序撮合（FIFO，先到先成交）
+     * 2. 成交价格：以限价单的价格成交（价格优先）
+     * 3. 如果限价单还有剩余，进入限价单队列等待
+     * 4. 发送成交结果到 MQ
+     * 
+     * 【撮合原则】
+     * - 时间优先：市价单按到达时间排序，先到先成交
+     * - 价格优先：成交价格以限价单的价格为准
+     * - 部分成交：如果市价单数量不足，可以部分成交
+     * 
+     * 【为什么需要 synchronized？】
+     * - LinkedList 不是线程安全的
+     * - 需要保护遍历和修改操作的原子性
+     * - 避免在遍历和移除订单时出现并发问题
+     * 
+     * 【例子】
+     * ```
+     * 新订单：买入 BTC/USDT，限价 50000，数量 1 BTC
+     * 
+     * 卖盘市价单队列（sellMarketQueue）：
+     *   [订单A: 0.3 BTC]  ← 先到
+     *   [订单B: 0.5 BTC]
+     *   [订单C: 0.2 BTC]
+     * 
+     * 撮合过程：
+     * 1. 与订单A撮合：成交 0.3 BTC，价格 50000（限价单价格）
+     * 2. 与订单B撮合：成交 0.5 BTC，价格 50000
+     * 3. 与订单C撮合：成交 0.2 BTC，价格 50000
+     * 4. 完全成交：限价单完全成交，订单A、B、C也完全成交
+     * ```
+     * 
+     * 【调用时机】
+     * 在 matchLimitPriceWithLPList() 之后调用：
+     * ```java
+     * // 先与限价单撮合
+     * matchLimitPriceWithLPList(limitPriceOrderList, exchangeOrder, false);
+     * 
+     * // 如果还没交易完，与市价单撮合
+     * if (exchangeOrder.getAmount().compareTo(exchangeOrder.getFilledAmount()) > 0) {
+     *     matchLimitPriceWithMPList(marketPriceOrderList, exchangeOrder);
+     * }
+     * ```
+     * 
+     * @param mpList 对手盘市价单队列（LinkedList<OrderDTO>，按时间排序，FIFO）
+     * @param focusedOrder 限价单订单（待撮合的订单）
      */
     private void matchLimitPriceWithMPList(LinkedList<OrderDTO> mpList, OrderDTO focusedOrder) {
-        List<TradeRecordDTO> exchangeTrades = new ArrayList<>();
-        List<OrderDTO> completedOrders = new ArrayList<>();
+        // ========== 第一步：初始化结果收集器 ==========
+        // 收集撮合过程中产生的成交记录和已完成订单
+        List<TradeRecordDTO> exchangeTrades = new ArrayList<>();  // 成交记录列表
+        List<OrderDTO> completedOrders = new ArrayList<>();  // 已完成订单列表
         
+        // ========== 第二步：遍历对手盘市价单队列进行撮合 ==========
+        // 使用 synchronized 保护整个撮合过程
+        // 原因：LinkedList 不是线程安全的，需要保护遍历和修改操作的原子性
         synchronized (mpList) {
+            // 获取市价单队列的迭代器（按时间排序，FIFO，先到先成交）
             Iterator<OrderDTO> iterator = mpList.iterator();
+            
+            // 遍历所有市价单
             while (iterator.hasNext()) {
+                // 获取对手盘市价单
                 OrderDTO matchOrder = iterator.next();
+                
+                // ========== 第三步：执行撮合 ==========
+                // 调用 processMatch() 计算成交价格、数量，并更新订单状态
+                // 成交价格：以限价单的价格成交（价格优先）
                 TradeRecordDTO trade = processMatch(focusedOrder, matchOrder);
+                
+                // 如果撮合成功，记录成交记录
                 if (trade != null) {
                     exchangeTrades.add(trade);
                 }
                 
-                if (matchOrder.getStatus() == 2) {  // COMPLETED
-                    iterator.remove();
-                    completedOrders.add(matchOrder);
+                // ========== 第四步：处理已完成的对手盘订单 ==========
+                // 如果对手盘市价单完全成交，从队列中移除
+                if (matchOrder.getStatus() == 2) {  // 2 = COMPLETED（完全成交）
+                    iterator.remove();  // 从市价单队列中移除
+                    completedOrders.add(matchOrder);  // 记录已完成订单
                 }
                 
-                if (focusedOrder.getStatus() == 2) {  // COMPLETED
+                // ========== 第五步：检查限价单是否完全成交 ==========
+                // 如果限价单完全成交，退出循环
+                if (focusedOrder.getStatus() == 2) {  // 2 = COMPLETED（完全成交）
                     completedOrders.add(focusedOrder);
-                    break;
+                    break;  // 退出循环
                 }
             }
         }
         
-        // 如果还没交易完，订单压入列表
+        // ========== 第六步：处理未完全成交的限价单 ==========
+        // 如果限价单还有剩余，进入限价单队列等待后续撮合
         if (focusedOrder.getAmount().compareTo(focusedOrder.getFilledAmount()) > 0) {
-            addLimitPriceOrder(focusedOrder);
+            addLimitPriceOrder(focusedOrder);  // 添加到限价单队列
         }
         
+        // ========== 第七步：发送撮合结果 ==========
+        // 发送成交记录到 MQ（由其他服务负责更新数据库和用户余额）
         handleExchangeTrade(exchangeTrades);
+        
+        // 发送已完成订单通知到 MQ
         orderCompleted(completedOrders);
     }
     
