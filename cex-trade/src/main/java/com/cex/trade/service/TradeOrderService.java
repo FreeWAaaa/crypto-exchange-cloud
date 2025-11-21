@@ -88,5 +88,25 @@ public interface TradeOrderService {
      */
     void updateOrderFilled(String orderNo, BigDecimal filledAmount, BigDecimal filledMoney, 
                           BigDecimal fee, Integer status);
+
+    /**
+     * 处理订单完成（分布式事务）
+     * 用于 MQ 消费者调用，包含解冻余额和更新订单状态
+     * 
+     * @param orderDTO 订单DTO
+     */
+    void handleOrderCompleted(com.cex.common.dto.OrderDTO orderDTO);
+
+    /**
+     * 处理成交记录（分布式事务）
+     * 用于 MQ 消费者调用，包含：
+     * 1. 更新订单成交信息
+     * 2. 处理买方资产变更（扣减冻结计价币，增加基础币）
+     * 3. 处理卖方资产变更（扣减冻结基础币，增加计价币）
+     * 4. 保存成交记录到数据库
+     * 
+     * @param tradeRecord 成交记录DTO
+     */
+    void processTradeRecord(com.cex.common.dto.TradeRecordDTO tradeRecord);
 }
 

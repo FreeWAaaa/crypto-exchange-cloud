@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Date;
 import java.util.HashMap;
@@ -34,6 +35,7 @@ public class AdminAuthServiceImpl implements AdminAuthService {
     private static final long TOKEN_EXPIRE_HOURS = 8;  // Token 8小时过期
     
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> login(String username, String password) {
         // 1. 查询管理员
         AdminUser admin = adminUserMapper.selectByUsername(username);
@@ -117,6 +119,7 @@ public class AdminAuthServiceImpl implements AdminAuthService {
     }
     
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public void changePassword(String token, String oldPassword, String newPassword) {
         // 获取当前管理员
         AdminUser admin = getAdminInfo(token);

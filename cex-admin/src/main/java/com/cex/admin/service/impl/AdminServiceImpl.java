@@ -9,6 +9,7 @@ import com.cex.common.core.domain.Result;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.HashMap;
 import java.util.List;
@@ -42,6 +43,7 @@ public class AdminServiceImpl implements AdminService {
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public Result<Void> updateConfig(String configKey, String configValue) {
         LambdaUpdateWrapper<SysConfig> wrapper = new LambdaUpdateWrapper<>();
         wrapper.eq(SysConfig::getConfigKey, configKey);

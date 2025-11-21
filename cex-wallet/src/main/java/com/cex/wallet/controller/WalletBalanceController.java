@@ -115,5 +115,69 @@ public class WalletBalanceController {
         log.info("钱包已解锁：userId={}, coin={}", userId, coin);
         return Result.success("钱包已解锁");
     }
+
+    /**
+     * 冻结余额（内部服务调用）
+     */
+    @PostMapping("/freeze")
+    public Result<Void> freezeBalance(
+            @RequestParam Long userId,
+            @RequestParam String coin,
+            @RequestParam BigDecimal amount,
+            @RequestParam(required = false) String relatedId,
+            @RequestParam(required = false) String remark) {
+        
+        balanceService.freezeBalance(userId, coin, amount, relatedId, remark);
+        log.info("冻结余额成功：userId={}, coin={}, amount={}, relatedId={}", userId, coin, amount, relatedId);
+        return Result.success("冻结成功");
+    }
+
+    /**
+     * 解冻余额（内部服务调用）
+     */
+    @PostMapping("/unfreeze")
+    public Result<Void> unfreezeBalance(
+            @RequestParam Long userId,
+            @RequestParam String coin,
+            @RequestParam BigDecimal amount,
+            @RequestParam(required = false) String relatedId,
+            @RequestParam(required = false) String remark) {
+        
+        balanceService.unfreezeBalance(userId, coin, amount, relatedId, remark);
+        log.info("解冻余额成功：userId={}, coin={}, amount={}, relatedId={}", userId, coin, amount, relatedId);
+        return Result.success("解冻成功");
+    }
+
+    /**
+     * 扣减冻结余额（成交后使用，内部服务调用）
+     */
+    @PostMapping("/decrease-frozen")
+    public Result<Void> decreaseFrozen(
+            @RequestParam Long userId,
+            @RequestParam String coin,
+            @RequestParam BigDecimal amount,
+            @RequestParam(required = false) String relatedId,
+            @RequestParam(required = false) String remark) {
+        
+        balanceService.decreaseFrozen(userId, coin, amount, relatedId, remark);
+        log.info("扣减冻结余额成功：userId={}, coin={}, amount={}, relatedId={}", userId, coin, amount, relatedId);
+        return Result.success("扣减冻结余额成功");
+    }
+
+    /**
+     * 增加可用余额（成交后使用，内部服务调用）
+     */
+    @PostMapping("/increase")
+    public Result<Void> increaseBalance(
+            @RequestParam Long userId,
+            @RequestParam String coin,
+            @RequestParam BigDecimal amount,
+            @RequestParam(required = false) String relatedId,
+            @RequestParam(required = false) String remark) {
+        
+        balanceService.increaseBalance(userId, coin, amount, relatedId, remark);
+        log.info("增加可用余额成功：userId={}, coin={}, amount={}, relatedId={}", userId, coin, amount, relatedId);
+        return Result.success("增加可用余额成功");
+    }
 }
 

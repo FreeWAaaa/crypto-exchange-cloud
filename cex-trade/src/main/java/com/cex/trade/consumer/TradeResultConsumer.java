@@ -11,13 +11,12 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.messaging.Message;
 import org.springframework.stereotype.Component;
 
-import java.math.BigDecimal;
 import java.util.function.Consumer;
 
 /**
  * 交易结果消费者
  * 
- * 接收撮合引擎的成交结果，更新订单状态
+ * 接收撮合引擎的成交结果，更新订单状态、处理资产变更、保存成交记录
  * 
  * @author cex
  */
@@ -33,6 +32,15 @@ public class TradeResultConsumer {
     
     /**
      * 接收撮合结果
+     * 
+     * 【处理流程】
+     * 1. 解析成交记录列表
+     * 2. 对每条成交记录：
+     *    - 更新买方订单成交信息
+     *    - 更新卖方订单成交信息
+     *    - 处理买方资产变更（扣减冻结计价币，增加基础币）
+     *    - 处理卖方资产变更（扣减冻结基础币，增加计价币）
+     *    - 保存成交记录到数据库
      */
     @Bean
     public Consumer<Message<String>> tradeResultInput() {
@@ -48,23 +56,45 @@ public class TradeResultConsumer {
                     JSONObject tradeJson = tradeArray.getJSONObject(i);
                     TradeRecordDTO tradeRecord = JSON.parseObject(tradeJson.toJSONString(), TradeRecordDTO.class);
                     
-                    // 更新买方订单
-                    updateOrderFromTrade(tradeRecord.getBuyOrderNo(), tradeRecord.getPrice(), 
-                                      tradeRecord.getAmount(), tradeRecord.getMoney(), tradeRecord.getBuyFee());
-                    
-                    // 更新卖方订单
-                    updateOrderFromTrade(tradeRecord.getSellOrderNo(), tradeRecord.getPrice(), 
-                                      tradeRecord.getAmount(), tradeRecord.getMoney(), tradeRecord.getSellFee());
+                    // 使用 Service 方法处理成交记录（包含分布式事务）
+                    // 这个方法内部会：
+                    // 1. 更新买方和卖方订单成交信息
+                    // 2. 处理买方资产变更（扣减冻结计价币，增加基础币）
+                    // 3. 处理卖方资产变更（扣减冻结基础币，增加计价币）
+                    // 4. 保存成交记录到数据库
+                    // 都在同一个分布式事务中
+                    tradeOrderService.processTradeRecord(tradeRecord);
                 }
                 
             } catch (Exception e) {
                 log.error("处理撮合结果失败", e);
+                // 抛出异常，让 MQ 重试
+                throw e;
             }
         };
     }
     
     /**
      * 接收订单完成通知
+     * 
+     * 【作用】
+     * 接收撮合引擎发送的订单完成通知，根据订单状态做不同处理：
+     * - status = 2 (COMPLETED)：订单完全成交
+     * - status = 3 (CANCELED)：订单被取消
+     * 
+     * 【处理逻辑】
+     * 1. 先解冻余额（远程调用 Wallet 服务）
+     * 2. 解冻成功后，更新订单状态到数据库（本地事务）
+     * 
+     * 【事务处理】
+     * - 先解冻余额：确保用户资金安全，如果失败不更新订单状态
+     * - 再更新订单状态：解冻成功后，使用本地事务更新
+     * - 失败处理：记录日志，可以重试（MQ 的 retry 机制）
+     * 
+     * 【为什么先解冻余额？】
+     * - 保证用户资金安全：先解冻，确保用户可以使用资金
+     * - 如果解冻失败，订单状态不更新，可以重试
+     * - 避免数据不一致：如果先更新订单状态，解冻失败会导致数据不一致
      */
     @Bean
     public Consumer<Message<String>> orderCompletedInput() {
@@ -80,58 +110,21 @@ public class TradeResultConsumer {
                     JSONObject orderJson = orderArray.getJSONObject(i);
                     OrderDTO orderDTO = JSON.parseObject(orderJson.toJSONString(), OrderDTO.class);
                     
-                    // 更新订单状态
-                    tradeOrderService.updateOrderFilled(
-                        orderDTO.getOrderNo(),
-                        orderDTO.getFilledAmount(),
-                        orderDTO.getFilledMoney(),
-                        BigDecimal.ZERO,  // TODO: 从配置获取手续费
-                        orderDTO.getStatus()
-                    );
+                    // 使用 Service 方法处理订单完成（包含分布式事务）
+                    // 这个方法内部会：
+                    // 1. 解冻余额（远程调用 Wallet 服务）
+                    // 2. 更新订单状态（本地数据库操作）
+                    // 都在同一个分布式事务中
+                    tradeOrderService.handleOrderCompleted(orderDTO);
                 }
                 
             } catch (Exception e) {
                 log.error("处理订单完成通知失败", e);
+                // 抛出异常，让 MQ 重试
+                throw e;
             }
         };
     }
     
-    /**
-     * 从成交记录更新订单
-     */
-    private void updateOrderFromTrade(String orderNo, java.math.BigDecimal price, java.math.BigDecimal amount, 
-                                     java.math.BigDecimal money, java.math.BigDecimal fee) {
-        try {
-            // 获取订单当前状态
-            var order = tradeOrderService.getByOrderNo(orderNo);
-            if (order == null) {
-                log.warn("订单不存在：{}", orderNo);
-                return;
-            }
-            
-            // 计算新的成交信息
-            java.math.BigDecimal newFilledAmount = order.getFilledAmount().add(amount);
-            java.math.BigDecimal newFilledMoney = order.getFilledMoney().add(money);
-            java.math.BigDecimal newFee = order.getFee().add(fee);
-            
-            // 判断订单状态
-            Integer status;
-            if (newFilledAmount.compareTo(order.getAmount()) >= 0) {
-                status = 2; // 完全成交
-            } else if (newFilledAmount.compareTo(java.math.BigDecimal.ZERO) > 0) {
-                status = 1; // 部分成交
-            } else {
-                status = 0; // 待成交
-            }
-            
-            // 更新订单
-            tradeOrderService.updateOrderFilled(orderNo, newFilledAmount, newFilledMoney, newFee, status);
-            
-            log.info("订单成交更新：orderNo={}, filledAmount={}, status={}", orderNo, newFilledAmount, status);
-            
-        } catch (Exception e) {
-            log.error("更新订单失败：orderNo={}", orderNo, e);
-        }
-    }
 }
 

@@ -218,6 +218,49 @@ services:
       SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cex_activity?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8
 
+  # Seata Server（分布式事务协调器）
+  seata-server:
+    image: seataio/seata-server:latest
+    container_name: seata-server
+    ports:
+      - "8091:8091"  # Seata Server 端口
+      - "7091:7091"  # Seata Console 端口
+    environment:
+      - SEATA_PORT=8091
+      - STORE_MODE=db  # 使用数据库存储（推荐，保证高可用）
+      - SEATA_CONFIG_NAME=file:/root/seata-config/registry
+      # 数据库配置（使用 MySQL 存储事务日志）
+      - SEATA_CONFIG_STORE_DB_TYPE=mysql
+      - SEATA_CONFIG_STORE_DB_URL=jdbc:mysql://mysql:3306/cex_seata?useUnicode=true&characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false
+      - SEATA_CONFIG_STORE_DB_USER=root
+      - SEATA_CONFIG_STORE_DB_PASSWORD=123456
+      - SEATA_CONFIG_STORE_DB_MIN_CONN=1
+      - SEATA_CONFIG_STORE_DB_MAX_CONN=20
+      # Nacos 注册中心配置
+      - SEATA_CONFIG_REGISTRY_TYPE=nacos
+      - SEATA_CONFIG_REGISTRY_NACOS_APPLICATION=seata-server
+      - SEATA_CONFIG_REGISTRY_NACOS_SERVER_ADDR=nacos:8848
+      - SEATA_CONFIG_REGISTRY_NACOS_GROUP=SEATA_GROUP
+      - SEATA_CONFIG_REGISTRY_NACOS_NAMESPACE=
+      - SEATA_CONFIG_REGISTRY_NACOS_USERNAME=nacos
+      - SEATA_CONFIG_REGISTRY_NACOS_PASSWORD=nacos
+      # Nacos 配置中心配置
+      - SEATA_CONFIG_CONFIG_TYPE=nacos
+      - SEATA_CONFIG_CONFIG_NACOS_SERVER_ADDR=nacos:8848
+      - SEATA_CONFIG_CONFIG_NACOS_GROUP=SEATA_GROUP
+      - SEATA_CONFIG_CONFIG_NACOS_NAMESPACE=
+      - SEATA_CONFIG_CONFIG_NACOS_USERNAME=nacos
+      - SEATA_CONFIG_CONFIG_NACOS_PASSWORD=nacos
+      - SEATA_CONFIG_CONFIG_NACOS_DATA_ID=seataServer.properties
+    volumes:
+      - /Users/subby/docker-data/seata/logs:/root/logs
+      - /Users/subby/docker-data/seata/sessionStore:/root/sessionStore
+    depends_on:
+      - mysql
+      - nacos
+    networks:
+      - default
+
   ipfs:
     image: ipfs/kubo:latest
     container_name: ipfs-node
